@@ -5,4 +5,10 @@ command: [
 
 env:
   - name: "DATABRICKS_WAREHOUSE_ID"
-    valueFrom: "sql_warehouse" 
+    valueFrom: "sql_warehouse"
+  - name: "DATABRICKS_SERVING_ENDPOINT"
+    valueFrom: "serving_endpoint"
+  - name: "SAMPLE_TABLE_PATH"
+    value: "steventan.what_if_simulation_apps.wine_data"
+  - name: "MLFLOW_TRACKING_URI"
+    value: "databricks" 

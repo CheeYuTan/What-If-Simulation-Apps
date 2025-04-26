@@ -1,15 +1,17 @@
-from dash import Dash, html, dcc, callback, Output, Input, State, ALL, dash_table, ctx
+from dash import Dash, html, dcc, callback, Output, Input, State, ALL, dash_table, ctx, no_update
 import dash_bootstrap_components as dbc
-from utils import read_table_data, get_column_stats
+from utils import read_table_data, get_column_stats, send_endpoint_request
 import pandas as pd
 import logging
 import numpy as np
+import io
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize the Dash app
+# Initialize the Dash app with store
 app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
 # Read the data and get column stats
@@ -139,25 +141,9 @@ try:
             dbc.Col(current_row[2] if current_row[2] else "", width=4)
         ], className="mb-3"))
     
-    # Create a data table component
-    table = dash_table.DataTable(
-        data=df.to_dict('records'),
-        columns=[{'name': col, 'id': col} for col in df.columns],
-        page_size=10,
-        style_table={'overflowX': 'auto'},
-        style_cell={
-            'textAlign': 'left',
-            'padding': '8px'
-        },
-        style_header={
-            'backgroundColor': 'rgb(230, 230, 230)',
-            'fontWeight': 'bold'
-        }
-    )
 except Exception as e:
     logger.error(f"Error in layout creation: {str(e)}", exc_info=True)
     controls = [html.Div(f"Error loading data: {str(e)}")]
-    table = html.Div()
 
 # Define callbacks for syncing slider and input
 @app.callback(
@@ -175,15 +161,187 @@ def sync_controls(slider_values, input_values):
     else:
         return input_values, input_values
 
+# Modify the prediction callback to store results
+@app.callback(
+    Output('prediction-output', 'children'),
+    Output('prediction-store', 'data'),
+    Output('download-button', 'disabled'),
+    Input('predict-button', 'n_clicks'),
+    State({'type': 'input', 'index': ALL}, 'value'),
+    State({'type': 'input', 'index': ALL}, 'id'),
+    State('dropdown-is_red', 'value'),
+    prevent_initial_call=True
+)
+def make_prediction(n_clicks, input_values, input_ids, is_red_value):
+    if n_clicks is None:
+        return "", None, True
+    
+    try:
+        # Create input data dictionary
+        input_data = {}
+        
+        # Add numeric values from inputs
+        for value, id_dict in zip(input_values, input_ids):
+            column = id_dict['index']
+            if column != 'is_red':  # Skip is_red as we get it from dropdown
+                input_data[column] = float(value)
+        
+        # Add is_red value
+        input_data['is_red'] = int(is_red_value)
+        
+        # Log the input data
+        logger.info(f"Sending prediction request with input data: {input_data}")
+        
+        # Send request to endpoint
+        result = send_endpoint_request(input_data)
+        
+        # Log the result
+        logger.info(f"Received response from endpoint: {result}")
+        logger.info(f"Response type: {type(result)}")
+        
+        # Handle nested response structure
+        if isinstance(result, dict) and 'predictions' in result:
+            predictions_data = result['predictions']
+            if isinstance(predictions_data, dict) and 'predictions' in predictions_data:
+                prediction = predictions_data['predictions'][0]
+                shap_values = predictions_data.get('shap_values', [])
+                feature_names = predictions_data.get('feature_names', [])
+                
+                # Store results for download
+                store_data = {
+                    'input_data': input_data,
+                    'prediction': prediction,
+                    'shap_values': shap_values[0] if shap_values else [],
+                    'feature_names': feature_names
+                }
+                
+                # Create the prediction alert with SHAP values if available
+                alert_content = [
+                    html.H4("Prediction Result", className="alert-heading"),
+                    html.Hr(),
+                    html.P(f"Quality Score: {float(prediction):.2f}", className="mb-0")
+                ]
+                
+                # Add SHAP values if available
+                if shap_values and feature_names and len(shap_values) > 0:
+                    shap_list = []
+                    for feature, value in zip(feature_names, shap_values[0]):
+                        shap_list.append(
+                            html.P(f"{feature}: {value:.3f}", 
+                                  className="mb-1",
+                                  style={'color': 'red' if value < 0 else 'green'})
+                        )
+                    alert_content.extend([
+                        html.Hr(),
+                        html.H5("Feature Contributions (SHAP Values):", className="mt-3"),
+                        *shap_list
+                    ])
+                
+                return (
+                    dbc.Alert(alert_content, color="success", className="mt-3"),
+                    store_data,
+                    False  # Enable download button
+                )
+            else:
+                logger.warning("Unexpected predictions structure")
+                return (
+                    dbc.Alert("Unexpected response format from the model", color="warning", className="mt-3"),
+                    None,
+                    True
+                )
+        else:
+            logger.warning("No predictions found in response")
+            return (
+                dbc.Alert("No predictions found in the model response", color="warning", className="mt-3"),
+                None,
+                True
+            )
+            
+    except Exception as e:
+        logger.error(f"Error making prediction: {str(e)}", exc_info=True)
+        return (
+            dbc.Alert(
+                [
+                    html.H4("Error", className="alert-heading"),
+                    html.Hr(),
+                    html.P(f"Error making prediction: {str(e)}", className="mb-0"),
+                    html.P("Check the logs for more details.", className="mt-2")
+                ],
+                color="danger",
+                className="mt-3"
+            ),
+            None,
+            True
+        )
+
+# Add download callback
+@app.callback(
+    Output("download-results", "data"),
+    Input("download-button", "n_clicks"),
+    State("prediction-store", "data"),
+    prevent_initial_call=True
+)
+def download_results(n_clicks, stored_data):
+    if not stored_data:
+        return no_update
+        
+    try:
+        # Create a DataFrame with input features
+        input_df = pd.DataFrame([stored_data['input_data']])
+        
+        # Add prediction column
+        input_df['prediction'] = stored_data['prediction']
+        
+        # Add SHAP values if available
+        if stored_data['shap_values'] and stored_data['feature_names']:
+            for feature, shap_value in zip(stored_data['feature_names'], stored_data['shap_values']):
+                input_df[f'shap_{feature}'] = shap_value
+                
+        # Generate timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Convert DataFrame to CSV
+        csv_string = input_df.to_csv(index=False)
+        
+        return dict(
+            content=csv_string,
+            filename=f'prediction_results_{timestamp}.csv',
+            type='text/csv'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error creating download file: {str(e)}", exc_info=True)
+        return no_update
+
 # Define the app layout
 app.layout = dbc.Container([
+    dcc.Store(id='prediction-store'),  # Store for prediction results
     dbc.Row([
         dbc.Col([
             html.H1('What-If Simulation App', className="text-center my-4"),
             html.H2('Input Controls', className="text-center mb-4"),
             *controls,
-            html.H2('Sample Data', className="text-center my-4"),
-            table
+            dbc.Row([
+                dbc.Col([
+                    dbc.Button(
+                        "Make Prediction",
+                        id="predict-button",
+                        color="primary",
+                        size="lg",
+                        className="w-100 mb-2"
+                    ),
+                    dbc.Button(
+                        "Download Results",
+                        id="download-button",
+                        color="success",
+                        size="lg",
+                        className="w-100 mb-2",
+                        disabled=True
+                    ),
+                    dcc.Download(id="download-results"),
+                    html.Div(id="prediction-output")
+                ], width={"size": 6, "offset": 3})
+            ], className="mt-4")
         ])
     ])
 ], fluid=True)
