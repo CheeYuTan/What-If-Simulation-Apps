@@ -1,6 +1,15 @@
 from dash import Dash, html, dcc, callback, Output, Input, State, ALL, dash_table, ctx, no_update
 import dash_bootstrap_components as dbc
-from utils import read_table_data, get_column_stats, send_endpoint_request
+from utils import (
+    read_table_data,
+    get_column_stats,
+    send_endpoint_request,
+    create_display_content,
+    format_llm_prompt,
+    send_interpreter_request,
+    stream_prediction_results,
+    create_prediction_display
+)
 import pandas as pd
 import logging
 import numpy as np
@@ -161,11 +170,12 @@ def sync_controls(slider_values, input_values):
     else:
         return input_values, input_values
 
-# Modify the prediction callback to store results
+# Modify the prediction callback
 @app.callback(
     Output('prediction-output', 'children'),
     Output('prediction-store', 'data'),
-    Output('download-button', 'disabled'),
+    Output('explain-button', 'disabled'),
+    Output('download-button', 'disabled'),  # Add download button to outputs
     Input('predict-button', 'n_clicks'),
     State({'type': 'input', 'index': ALL}, 'value'),
     State({'type': 'input', 'index': ALL}, 'id'),
@@ -174,8 +184,8 @@ def sync_controls(slider_values, input_values):
 )
 def make_prediction(n_clicks, input_values, input_ids, is_red_value):
     if n_clicks is None:
-        return "", None, True
-    
+        return "", None, True, True
+        
     try:
         # Create input data dictionary
         input_data = {}
@@ -197,63 +207,64 @@ def make_prediction(n_clicks, input_values, input_ids, is_red_value):
         
         # Log the result
         logger.info(f"Received response from endpoint: {result}")
-        logger.info(f"Response type: {type(result)}")
         
         # Handle nested response structure
         if isinstance(result, dict) and 'predictions' in result:
             predictions_data = result['predictions']
             if isinstance(predictions_data, dict) and 'predictions' in predictions_data:
                 prediction = predictions_data['predictions'][0]
-                shap_values = predictions_data.get('shap_values', [])
+                shap_values = predictions_data.get('shap_values', [[]])[0]
                 feature_names = predictions_data.get('feature_names', [])
                 
-                # Store results for download
+                # Store results for explanation
                 store_data = {
                     'input_data': input_data,
                     'prediction': prediction,
-                    'shap_values': shap_values[0] if shap_values else [],
-                    'feature_names': feature_names
+                    'shap_values': shap_values,
+                    'feature_names': feature_names,
+                    'interpretation': None  # Initialize interpretation as None
                 }
                 
-                # Create the prediction alert with SHAP values if available
+                # Create prediction display
                 alert_content = [
                     html.H4("Prediction Result", className="alert-heading"),
                     html.Hr(),
-                    html.P(f"Quality Score: {float(prediction):.2f}", className="mb-0")
+                    html.P(f"Quality Score: {float(prediction):.2f}", className="mb-0"),
+                    html.Hr(),
+                    html.H5("Feature Contributions (SHAP Values):", className="mt-3")
                 ]
                 
                 # Add SHAP values if available
-                if shap_values and feature_names and len(shap_values) > 0:
-                    shap_list = []
-                    for feature, value in zip(feature_names, shap_values[0]):
-                        shap_list.append(
-                            html.P(f"{feature}: {value:.3f}", 
+                if shap_values and feature_names:
+                    # Sort features by absolute SHAP value
+                    feature_impacts = list(zip(feature_names, shap_values))
+                    feature_impacts.sort(key=lambda x: abs(x[1]), reverse=True)
+                    
+                    for feature, value in feature_impacts:
+                        alert_content.append(
+                            html.P(f"{feature}: {value:.3f}",
                                   className="mb-1",
                                   style={'color': 'red' if value < 0 else 'green'})
                         )
-                    alert_content.extend([
-                        html.Hr(),
-                        html.H5("Feature Contributions (SHAP Values):", className="mt-3"),
-                        *shap_list
-                    ])
                 
                 return (
                     dbc.Alert(alert_content, color="success", className="mt-3"),
                     store_data,
-                    False  # Enable download button
+                    False,  # Enable explain button
+                    False   # Enable download button
                 )
             else:
-                logger.warning("Unexpected predictions structure")
                 return (
                     dbc.Alert("Unexpected response format from the model", color="warning", className="mt-3"),
                     None,
+                    True,
                     True
                 )
         else:
-            logger.warning("No predictions found in response")
             return (
                 dbc.Alert("No predictions found in the model response", color="warning", className="mt-3"),
                 None,
+                True,
                 True
             )
             
@@ -264,15 +275,69 @@ def make_prediction(n_clicks, input_values, input_ids, is_red_value):
                 [
                     html.H4("Error", className="alert-heading"),
                     html.Hr(),
-                    html.P(f"Error making prediction: {str(e)}", className="mb-0"),
-                    html.P("Check the logs for more details.", className="mt-2")
+                    html.P(f"Error making prediction: {str(e)}", className="mb-0")
                 ],
                 color="danger",
                 className="mt-3"
             ),
             None,
+            True,
             True
         )
+
+@app.callback(
+    Output('explanation-output', 'children'),
+    Output('prediction-store', 'data', allow_duplicate=True),  # Add store update
+    Input('explain-button', 'n_clicks'),
+    State('prediction-store', 'data'),
+    prevent_initial_call=True
+)
+def get_explanation(n_clicks, store_data):
+    if n_clicks is None or store_data is None:
+        return no_update, no_update
+        
+    try:
+        # Format the prompt
+        prompt = format_llm_prompt(
+            prediction=store_data['prediction'],
+            input_features=store_data['input_data'],
+            shap_values=store_data['shap_values'],
+            feature_names=store_data['feature_names']
+        )
+        
+        # Get explanation
+        explanation = send_interpreter_request(prompt)
+        
+        # Update store data with interpretation
+        store_data['interpretation'] = explanation
+            
+        # Create display
+        return dbc.Alert(
+            [
+                html.H4("AI Interpretation", className="alert-heading"),
+                html.Hr(),
+                html.Div(
+                    [html.P(line) for line in explanation.split('\n') if line.strip()],
+                    style={
+                        'white-space': 'pre-wrap',
+                        'padding': '1rem',
+                        'background-color': '#ffffff',
+                        'border-radius': '0.25rem',
+                        'border': '1px solid #dee2e6'
+                    }
+                )
+            ],
+            color="info",
+            className="mt-3"
+        ), store_data
+            
+    except Exception as e:
+        logger.error(f"Error getting explanation: {str(e)}", exc_info=True)
+        return dbc.Alert(
+            f"Error getting explanation: {str(e)}",
+            color="danger",
+            className="mt-3"
+        ), no_update
 
 # Add download callback
 @app.callback(
@@ -296,6 +361,14 @@ def download_results(n_clicks, stored_data):
         if stored_data['shap_values'] and stored_data['feature_names']:
             for feature, shap_value in zip(stored_data['feature_names'], stored_data['shap_values']):
                 input_df[f'shap_{feature}'] = shap_value
+        
+        # Add AI interpretation if available
+        if 'interpretation' in stored_data and stored_data['interpretation']:
+            # Clean up the interpretation text (remove markdown and extra whitespace)
+            interpretation_text = stored_data['interpretation']
+            interpretation_text = interpretation_text.replace('**', '')  # Remove markdown bold
+            interpretation_text = '\n'.join(line.strip() for line in interpretation_text.split('\n') if line.strip())
+            input_df['ai_interpretation'] = interpretation_text
                 
         # Generate timestamp for filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -331,6 +404,14 @@ app.layout = dbc.Container([
                         className="w-100 mb-2"
                     ),
                     dbc.Button(
+                        "Explain Results",
+                        id="explain-button",
+                        color="info",
+                        size="lg",
+                        className="w-100 mb-2",
+                        disabled=True
+                    ),
+                    dbc.Button(
                         "Download Results",
                         id="download-button",
                         color="success",
@@ -339,7 +420,8 @@ app.layout = dbc.Container([
                         disabled=True
                     ),
                     dcc.Download(id="download-results"),
-                    html.Div(id="prediction-output")
+                    html.Div(id="prediction-output"),
+                    html.Div(id="explanation-output")
                 ], width={"size": 6, "offset": 3})
             ], className="mt-4")
         ])

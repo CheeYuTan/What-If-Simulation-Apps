@@ -11,4 +11,6 @@ env:
   - name: "SAMPLE_TABLE_PATH"
     value: "steventan.what_if_simulation_apps.wine_data"
   - name: "MLFLOW_TRACKING_URI"
-    value: "databricks" 
+    value: "databricks"
+  - name: "INTERPRETER_SERVING_ENDPOINT"
+    valueFrom: "interpreter_serving_endpoint" 
