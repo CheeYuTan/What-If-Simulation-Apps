@@ -362,13 +362,12 @@ uc_registered_model_info = mlflow.register_model(
 # COMMAND ----------
 
 from databricks import agents
-from databricks.sdk.service.serving import ServedModelInputWorkloadSize
 
 deployment = agents.deploy(
     model_name=UC_MODEL_NAME,
     model_version=uc_registered_model_info.version,
     scale_to_zero=True,
-    workload_size=ServedModelInputWorkloadSize.SMALL,
+    workload_size='Small',
     tags={
         "endpointSource": "playground",
         "environment": "dev",
